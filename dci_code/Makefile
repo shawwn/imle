@@ -28,6 +28,8 @@
 # 3. Set PYTHON_DIR and NUMPY_DIR to the directories for Python and Numpy (Note that the code only supports Python 2.7)
 # 4. Run make
 
+# sudo apt-get install libblas-dev
+
 CC=gcc
 BLAS=netlib
 NETLIB_DIR=/usr/lib/libblas
