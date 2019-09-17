@@ -306,8 +306,25 @@ static PyMethodDef py_dci_methods[] = {
     {NULL, NULL, 0, NULL}
 };
 
+static struct PyModuleDef cModPyDem =
+{
+    PyModuleDef_HEAD_INIT,
+    "dci",       /* name of module */
+    "",          /* module documentation, may be NULL */
+    -1,          /* size of per-interpreter state of the module, or -1 if the module keeps state in global variables. */
+    py_dci_methods
+};
+
+PyMODINIT_FUNC PyInit__dci(void)
+{
+    import_array();     // Import Numpy
+    return PyModule_Create(&cModPyDem);
+}
+
 // Module name is "_dci"
 PyMODINIT_FUNC init_dci(void) {
-    (void) Py_InitModule("_dci", py_dci_methods);
+    // The following line was valid in Python 2.7, but not 3.7
+    // See https://stackoverflow.com/questions/28305731/compiler-cant-find-py-initmodule-is-it-deprecated-and-if-so-what-should-i
+    //(void) Py_InitModule("_dci", py_dci_methods);
     import_array();     // Import Numpy
 }

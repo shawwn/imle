@@ -34,8 +34,8 @@ NETLIB_DIR=/usr/lib/libblas
 ATLAS_DIR=/usr/lib/atlas-base
 OPENBLAS_DIR=/usr/lib/openblas-base
 MKL_DIR=/opt/intel/mkl
-PYTHON_DIR=/usr/include/python2.7
-NUMPY_DIR=/usr/local/lib/python2.7/dist-packages/numpy/core/include
+PYTHON_DIR=/usr/include/python3.7
+NUMPY_DIR=/usr/local/lib/python3.7/dist-packages/numpy/core/include/
 
 SRC_DIR=src
 INCL_DIR=include
@@ -70,8 +70,8 @@ ALL_INCL_FLAGS=$(addprefix -I,$(ALL_INCL_DIRS))
 .PHONY: all
 
 all: $(BUILD_DIR)/_dci.so
-	ln -sf $(BUILD_DIR)/_dci.so .
-	ln -sf $(SRC_DIR)/dci.py .
+	cp $(BUILD_DIR)/_dci.so .
+	cp $(SRC_DIR)/dci.py .
 
 $(BUILD_DIR)/%.so: $(BUILD_DIR)/py%.o $(OBJ_PATHS)
 	$(CC) -shared -o $@ $^ $(GEN_FLAGS) $(LIB_FLAGS)
