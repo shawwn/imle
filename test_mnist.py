@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torchvision
 from torch import nn
+from torch.nn import Parameter
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
@@ -50,6 +51,94 @@ def circ_generator(latents_interpolate):
 def mse(x, y):
     return (np.square(x - y)).mean()
 
+def l2normalize(v, eps=1e-4):
+  return v / (v.norm() + eps)
+
+class SpectralNorm(nn.Module):
+  def __init__(self, module, name='weight', power_iterations=1):
+    super(SpectralNorm, self).__init__()
+    self.module = module
+    self.name = name
+    self.power_iterations = power_iterations
+    if not self._made_params():
+      self._make_params()
+
+  def _update_u_v(self):
+    u = getattr(self.module, self.name + "_u")
+    v = getattr(self.module, self.name + "_v")
+    w = getattr(self.module, self.name + "_bar")
+
+    height = w.data.shape[0]
+    _w = w.view(height, -1)
+    for _ in range(self.power_iterations):
+      v = l2normalize(torch.matmul(_w.t(), u))
+      u = l2normalize(torch.matmul(_w, v))
+
+    sigma = u.dot((_w).mv(v))
+    setattr(self.module, self.name, w / sigma.expand_as(w))
+
+  def _made_params(self):
+    try:
+      getattr(self.module, self.name + "_u")
+      getattr(self.module, self.name + "_v")
+      getattr(self.module, self.name + "_bar")
+      return True
+    except AttributeError:
+      return False
+
+  def _make_params(self):
+    w = getattr(self.module, self.name)
+
+    height = w.data.shape[0]
+    width = w.view(height, -1).data.shape[1]
+
+    u = Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)
+    v = Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)
+    u.data = l2normalize(u.data)
+    v.data = l2normalize(v.data)
+    w_bar = Parameter(w.data)
+
+    del self.module._parameters[self.name]
+    self.module.register_parameter(self.name + "_u", u)
+    self.module.register_parameter(self.name + "_v", v)
+    self.module.register_parameter(self.name + "_bar", w_bar)
+
+  def forward(self, *args):
+    self._update_u_v()
+    return self.module.forward(*args)
+
+class SelfAttention(nn.Module):
+  """ Self Attention Layer"""
+
+  def __init__(self, in_dim, activation=F.relu):
+    super().__init__()
+    self.chanel_in = in_dim
+    self.activation = activation
+
+    self.theta = SpectralNorm(nn.Conv2d(in_channels=in_dim, out_channels=in_dim // 8, kernel_size=1, bias=False))
+    self.phi = SpectralNorm(nn.Conv2d(in_channels=in_dim, out_channels=in_dim // 8, kernel_size=1, bias=False))
+    self.pool = nn.MaxPool2d(2, 2)
+    self.g = SpectralNorm(nn.Conv2d(in_channels=in_dim, out_channels=in_dim // 2, kernel_size=1, bias=False))
+    self.o_conv = SpectralNorm(nn.Conv2d(in_channels=in_dim // 2, out_channels=in_dim, kernel_size=1, bias=False))
+    self.gamma = nn.Parameter(torch.zeros(1))
+
+    self.softmax = nn.Softmax(dim=-1)
+
+  def forward(self, x):
+    m_batchsize, C, width, height = x.size()
+    N = height * width
+
+    theta = self.theta(x)
+    phi = self.phi(x)
+    phi = self.pool(phi)
+    phi = phi.view(m_batchsize, -1, N // 4)
+    theta = theta.view(m_batchsize, -1, N)
+    theta = theta.permute(0, 2, 1)
+    attention = self.softmax(torch.bmm(theta, phi))
+    g = self.pool(self.g(x)).view(m_batchsize, -1, N // 4)
+    attn_g = torch.bmm(g, attention.permute(0, 2, 1)).view(m_batchsize, -1, width, height)
+    out = self.o_conv(attn_g)
+    return self.gamma * out + x
 
 class ConvolutionalImplicitModel(nn.Module):
     def __init__(self, z_dim):
@@ -62,17 +151,58 @@ class ConvolutionalImplicitModel(nn.Module):
         self.tconv3 = nn.ConvTranspose2d(128, 64, 4, 2, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(64)
         self.tconv4 = nn.ConvTranspose2d(64, 1, 4, 2, padding=1, bias=False)
-        self.bn4 = nn.BatchNorm2d(1)
+        self.bn4 = None
+        #self.bn4 = nn.BatchNorm2d(1)
         self.relu = nn.ReLU(True)
+        chn = 32
+        self.attention = None
+        self.attention = SelfAttention(2 * chn)
         
     def forward(self, z):
         z = self.relu(self.bn1(self.tconv1(z)))
         z = self.relu(self.bn2(self.tconv2(z)))
         z = self.relu(self.bn3(self.tconv3(z)))
-        z = torch.sigmoid(self.bn4(self.tconv4(z)))
+        if self.attention:
+          z = self.attention(z)
+        z = self.tconv4(z)
+        if self.bn4 is not None:
+          z = self.bn4(z)
+        z = torch.sigmoid(z)
         return z
 
 
+def pearsonr(x, y):
+  mean_x = torch.mean(x)
+  mean_y = torch.mean(y)
+  xm = x.sub(mean_x)
+  ym = y.sub(mean_y)
+  r_num = xm.dot(ym)
+  r_den = torch.norm(xm, 2) * torch.norm(ym, 2)
+  r_val = r_num / r_den
+  return r_val
+
+
+class NetPerLayer(nn.Module):
+  def __init__(self):
+    super(NetPerLayer, self).__init__()
+
+    net = torchvision.models.resnet18(pretrained=True)
+    net.eval()
+
+    self.nodeLevels = nn.ModuleList()
+    self.nodeLevels.append(nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool))
+    self.nodeLevels.append(net.layer1)
+    self.nodeLevels.append(net.layer2)
+    self.nodeLevels.append(net.layer3)
+    self.nodeLevels.append(net.layer4)
+    #self.nodeLevels.append(nn.MaxPool2d(8))
+
+  def forward(self, x):
+    activations = []
+    for m in self.nodeLevels:
+      x = m(x)
+      activations.append(x)
+    return activations
 
 class CoolSystem(pl.LightningModule):
 
@@ -85,7 +215,9 @@ class CoolSystem(pl.LightningModule):
         self.shuffle_data = shuffle_data
         self.dci_db = None
         self.model = ConvolutionalImplicitModel(z_dim)
-        self.loss_fn = nn.MSELoss()
+        #self.squeezeNet = NetPerLayer()
+        self.squeezeNet = None
+        #self.loss_fn = nn.MSELoss()
         self._step = 0
 
     def regen(self, batch):
@@ -152,9 +284,9 @@ class CoolSystem(pl.LightningModule):
         #z_np = self.regen()
         z_np = self.z_np
         #cur_z = torch.from_numpy(z_np[i*batch_size:(i+1)*batch_size]).float().cpu()
-        #cur_data = torch.from_numpy(data_np[i*batch_size:(i+1)*batch_size]).float().cpu()
+        #imgTarget = torch.from_numpy(data_np[i*batch_size:(i+1)*batch_size]).float().cpu()
         cur_z = torch.from_numpy(z_np).float().cpu()
-        cur_data = torch.from_numpy(data_np).float().cpu()
+        imgTarget = torch.from_numpy(data_np).float().cpu()
         print(cur_z.shape, batch_idx)
         def nimg(img):
           #img = img + 1
@@ -164,17 +296,38 @@ class CoolSystem(pl.LightningModule):
           return img
         imgInput = batch[0]
         self.logger.experiment.add_image('imgInput', torchvision.utils.make_grid(nimg(imgInput)), self._step)
-        cur_samples = self.forward(cur_z)
-        self.logger.experiment.add_image('imgOutput', torchvision.utils.make_grid(nimg(cur_samples)), self._step)
-        if self._step % 1 == 0:
+        imgOutput = self.forward(cur_z)
+        self.logger.experiment.add_image('imgOutput', torchvision.utils.make_grid(nimg(imgOutput)), self._step)
+        if self._step % 1 == 0 and False:
           #print('circle...')
           imgs = self.circle_interpolation(imgInput.shape[0])
           #imgs = np.array(imgs)
           #imgs = torch.from_numpy(imgs).float().cpu()
           self.logger.experiment.add_image('imgInterp', torchvision.utils.make_grid(nimg(imgs)), self._step)
           #import pdb; pdb.set_trace()
-        #print('done')
-        loss = self.loss_fn(cur_samples, cur_data)
+        if self.squeezeNet is not None:
+          #print('squeezeNet(imgTarget)...')
+          activationsTarget = self.squeezeNet(imgTarget.repeat(1,3,1,1))
+          #print('squeezeNet(imgOutput)...')
+          activationsOutput = self.squeezeNet(imgOutput.repeat(1,3,1,1))
+          #print('loss...')
+          featLoss = None
+          #for actTarget, actOutput in zip(activationsTarget[1:3], activationsOutput[1:3]):
+          #for actTarget, actOutput in tqdm.tqdm(list(zip(activationsTarget, activationsOutput))):
+          for actTarget, actOutput in zip(activationsTarget, activationsOutput):
+            #l = F.mse_loss(actTarget, actOutput)
+            #l = torch.abs(actTarget - actOutput).sum()
+            #l = F.l1_loss(actTarget, actOutput)
+
+            l = -pearsonr(actTarget.view(-1), actOutput.view(-1))
+            if featLoss is None:
+              featLoss = l
+            else:
+              featLoss += l
+        else:
+          featLoss = 0.0
+        pixelLoss = F.mse_loss(imgOutput, imgTarget)
+        loss = featLoss + pixelLoss
         tensorboard_logs = {'train_loss': loss}
         self._step += 1
         return {'loss': loss, 'log': tensorboard_logs}
@@ -275,7 +428,9 @@ class CoolSystem(pl.LightningModule):
         epoch = 0
         hyperparams = self.hyperparams
         lr = hyperparams.base_lr * hyperparams.decay_rate ** (epoch // hyperparams.decay_step)
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=1e-5)
+        #optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=1e-5)
+        #optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, amsgrad=True)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.5, 0.999), amsgrad=True)
         return optimizer
         
 
@@ -329,8 +484,8 @@ class CoolSystem(pl.LightningModule):
 def main():
   from pytorch_lightning import Trainer
 
-  #hparams = Hyperparams(base_lr=1e-3, batch_size=64, num_epochs=10, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=0.1)
-  hparams = Hyperparams(base_lr=1e-3, batch_size=64, num_epochs=10, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=1.0)
+  hparams = Hyperparams(base_lr=1e-3, batch_size=64, num_epochs=10, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=0.1)
+  #hparams = Hyperparams(base_lr=1e-3, batch_size=64, num_epochs=10, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=1.0)
   z_dim = 64
   model = CoolSystem(z_dim, hparams)
 
