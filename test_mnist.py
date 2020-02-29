@@ -21,6 +21,17 @@ import collections
 Hyperparams = collections.namedtuple('Hyperarams', 'base_lr batch_size num_epochs decay_step decay_rate staleness num_samples_factor train_percent')
 Hyperparams.__new__.__defaults__ = (None, None, None, None, None, None, None, None)
 
+class Namespace():
+  pass
+
+me = Namespace()
+me.max_step = 1.0/64.0
+me.max_step *= 2
+#me.radius = 0.1
+me.radius = 0.5
+me.interp_every = 10
+
+
 def one_hot_encode(x, n_class):
   from torch.autograd import Variable
   #class_emb = self.linear(class_id)  # 128
@@ -48,10 +59,11 @@ def np_latent_and_labels(z, class_id, n_class):
   z = np.concatenate([class_emb, z], 1)
   return z
 
-def rand_latent(class_id,z_dim=64,n_class=10):
-  latents_a = np.random.randn(1, z_dim)#.reshape([1,-1,1,1])
-  return np_latent_and_labels(latents_a, class_id, n_class=n_class)
-
+def rand_latent(class_id=None,z_dim=64,n_class=10):
+  z = np.random.randn(1, z_dim)#.reshape([1,-1,1,1])
+  if class_id is not None:
+    z = np_latent_and_labels(z, class_id, n_class=n_class)
+  return z
 
 #Gs = Gs_network
 #rnd = np.random
@@ -60,9 +72,9 @@ def rand_latent(class_id,z_dim=64,n_class=10):
 #latents_b = rnd.randn(1, shape[1])
 #latents_c = rnd.randn(1, shape[1])
 #import pdb; pdb.set_trace()
-latents_a = rand_latent(4)
-latents_b = rand_latent(4)
-latents_c = rand_latent(4)
+me.latents_a = rand_latent()
+me.latents_b = rand_latent()
+me.latents_c = rand_latent()
 import pdb; pdb.set_trace()
 
 import math
@@ -76,14 +88,58 @@ def vnorm(v):
 
 def circ_generator(latents_interpolate):
     #radius = 40.0
-    radius = 0.1
-    latents_axis_x = (latents_a - latents_b).flatten() / vdist(latents_a - latents_b)
-    latents_axis_y = (latents_a - latents_c).flatten() / vdist(latents_a - latents_c)
+    #radius = 0.1
+    radius = me.radius
+    latents_axis_x = (me.latents_a - me.latents_b).flatten() / vdist(me.latents_a - me.latents_b)
+    latents_axis_y = (me.latents_a - me.latents_c).flatten() / vdist(me.latents_a - me.latents_c)
     latents_x = math.sin(math.pi * 2.0 * latents_interpolate) * radius
     latents_y = math.cos(math.pi * 2.0 * latents_interpolate) * radius
-    latents = latents_a + latents_x * latents_axis_x + latents_y * latents_axis_y
+    latents = me.latents_a + latents_x * latents_axis_x + latents_y * latents_axis_y
+    class_id=1
+    n_class=10
+    latents = np_latent_and_labels(latents, class_id, n_class=n_class)
     return latents
 
+me.circ_generator = circ_generator
+
+def circle_interpolation(model, count, gen_func=None, max_step=None, change_min=10.0, change_max=11.0):
+    if gen_func is None:
+      gen_func = me.circ_generator
+    if max_step is None:
+      max_step = me.max_step
+
+    def gen_latent(pos):
+      z = gen_func(pos)
+      z = z.reshape([1,-1,1,1])
+      return z
+
+    def generate(current_latent):
+        #fmt = dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True)
+        #current_image = Gs.run(current_latent, None, truncation_psi=0.5, randomize_noise=False, output_transform=fmt)[0]
+        z = np.array(current_latent)
+        z = torch.from_numpy(z).float().cpu()
+        imgs = model(z)
+        return imgs
+
+    def build_latent(count, current_pos=0.0):
+      current_latent = gen_latent(current_pos)
+      yield current_latent
+      for i in range(count - 1):
+          lower = current_pos
+          upper = current_pos + max_step
+          current_pos = (upper + lower) / 2.0
+          current_latent = gen_latent(current_pos)
+          yield current_latent
+
+    def get_latents(count):
+      z = list(build_latent(count))
+      z = np.concatenate(z, axis=0)
+      return z
+
+    z = get_latents(count)
+    return generate(z)
+
+me.circle_interpolation = circle_interpolation
 
 def mse(x, y):
     return (np.square(x - y)).mean()
@@ -490,10 +546,10 @@ class CoolSystem(pl.LightningModule):
         self.logger.experiment.add_image('imgInput', torchvision.utils.make_grid(nimg(imgInput)), self._step)
         imgOutput = self.forward(cur_z, imgLabels)
         self.logger.experiment.add_image('imgOutput', torchvision.utils.make_grid(nimg(imgOutput)), self._step)
-        if self._step % 20 == 0 and True:
+        if self._step % me.interp_every == 0 and self._step > -1 and True:
           #print('circle...')
           #import pdb; pdb.set_trace()
-          imgs = self.circle_interpolation(imgInput.shape[0])
+          imgs = me.circle_interpolation(self.model, imgInput.shape[0])
           #imgs = np.array(imgs)
           #imgs = torch.from_numpy(imgs).float().cpu()
           self.logger.experiment.add_image('imgInterp', torchvision.utils.make_grid(nimg(imgs)), self._step)
@@ -533,77 +589,6 @@ class CoolSystem(pl.LightningModule):
           z = gen_func(pos)
           z = z.reshape([1,-1,1,1])
           return z
-
-
-    def circle_interpolation(self, count, gen_func=circ_generator, max_step=1.0/64.0, change_min=10.0, change_max=11.0):
-        hyperparams = self.hyperparams
-        batch_size = hyperparams.batch_size
-
-        def gen_latent(pos):
-          z = gen_func(pos)
-          z = z.reshape([1,-1,1,1])
-          return z
-
-        def generate(current_latent):
-            #fmt = dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True)
-            #current_image = Gs.run(current_latent, None, truncation_psi=0.5, randomize_noise=False, output_transform=fmt)[0]
-            z = np.array(current_latent)
-            #z = z.reshape([batch_size,-1,1,1])
-            z = torch.from_numpy(z).float().cpu()
-            imgs = self.model(z)
-            return imgs
-
-        def build_latent(count, current_pos=0.0):
-          current_latent = gen_latent(current_pos)
-          yield current_latent
-          for i in range(count - 1):
-              lower = current_pos
-              upper = current_pos + max_step
-              current_pos = (upper + lower) / 2.0
-              current_latent = gen_latent(current_pos)
-              yield current_latent
-
-        def get_latents(count):
-          z = list(build_latent(count))
-          z = np.concatenate(z, axis=0)
-          return z
-
-        z = get_latents(count)
-        return generate(z)
-
-        current_pos = 0.0
-        current_latent = gen_func(current_pos)
-        current_image = generate(current_latent)
-        array_list = []
-        with tqdm.tqdm(total=count) as pbar:
-          while current_pos < 1.0 and len(array_list) < count:
-              array_list.append(current_image)
-              pbar.update(1)
-              lower = current_pos
-              upper = current_pos + max_step
-              current_pos = (upper + lower) / 2.0
-              current_latent = gen_func(current_pos)
-              current_image = generate(current_latent)
-              if False:
-                  current_mse = mse(array_list[-1], current_image)
-                  prev_pos = current_pos
-                  while current_mse < change_min or current_mse > change_max:
-                      if current_mse < change_min:
-                          lower = current_pos
-                          current_pos = (upper + lower) / 2.0
-                      if current_mse > change_max:
-                          upper = current_pos
-                          current_pos = (upper + lower) / 2.0
-                      current_latent = gen_func(current_pos)
-                      current_image = generate(current_latent)
-                      current_mse = mse(array_list[-1], current_image)
-                      diff = abs(prev_pos - current_pos)
-                      if diff < 0.001:
-                        break
-                      #print('inner', current_pos, 'delta', diff, 'mse', current_mse)
-                      prev_pos = current_pos
-                  #print('outer', current_pos, current_mse)
-        return array_list
 
 #     def validation_step(self, batch, batch_idx):
 #         # OPTIONAL
