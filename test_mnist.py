@@ -6,7 +6,7 @@ import torchvision
 from torch import nn
 from torch.nn import Parameter
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import MNIST
 from torchvision.datasets import CIFAR10
 from torchvision import transforms
@@ -26,10 +26,13 @@ class Namespace():
   pass
 
 me = Namespace()
-me.max_step = 1.0/64.0
-me.max_step *= 2
+#me.batch_size = 32
+me.z_dim = 128
+me.batch_size = 64
+me.max_step = 2.0/me.batch_size
 #me.radius = 0.1
-me.radius = 0.5
+#me.radius = 0.5
+me.radius = 2.0
 me.interp_every = 10
 
 
@@ -60,7 +63,9 @@ def np_latent_and_labels(z, class_id, n_class):
   z = np.concatenate([class_emb, z], 1)
   return z
 
-def rand_latent(class_id=None,z_dim=64,n_class=10):
+def rand_latent(class_id=None,z_dim=None,n_class=10):
+  if z_dim is None:
+    z_dim = me.z_dim
   z = np.random.randn(1, z_dim)#.reshape([1,-1,1,1])
   if class_id is not None:
     z = np_latent_and_labels(z, class_id, n_class=n_class)
@@ -68,7 +73,7 @@ def rand_latent(class_id=None,z_dim=64,n_class=10):
 
 #Gs = Gs_network
 #rnd = np.random
-#shape = [64, 64, 1, 1]
+#shape = [128, 128, 1, 1]
 #latents_a = rnd.randn(1, shape[1])
 #latents_b = rnd.randn(1, shape[1])
 #latents_c = rnd.randn(1, shape[1])
@@ -386,7 +391,11 @@ class ConvolutionalImplicitModel(nn.Module):
     def __init__(self, z_dim, n_class=10):
         super(ConvolutionalImplicitModel, self).__init__()
         self.n_class = n_class
-        self.tconv1 = nn.ConvTranspose2d(64+n_class, 1024, 1, 1, bias=False)
+        #self.tconv0 = nn.ConvTranspose2d(z_dim+n_class, 4096, 1, 1, bias=False)
+        #self.bn0 = nn.BatchNorm2d(4096)
+        self.tconv0 = None
+        self.bn0 = None
+        self.tconv1 = nn.ConvTranspose2d(z_dim+n_class, 1024, 1, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(1024)
         self.tconv2 = nn.ConvTranspose2d(1024, 128, 8, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(128)
@@ -396,12 +405,11 @@ class ConvolutionalImplicitModel(nn.Module):
         self.bn4 = None
         self.relu = nn.ReLU(True)
         chn = 32
-        self.attention = None
-        self.attention0 = SelfAttention(2 * chn)
-        self.attention1 = SelfAttention(2 * chn)
-        self.attention2 = SelfAttention(2 * chn)
+        self.attention0 = None # SelfAttention(2 * chn)
+        self.attention1 = None # SelfAttention(2 * chn)
+        self.attention2 = None # SelfAttention(2 * chn)
         self.attention3 = SelfAttention(2 * chn)
-        self.attention4 = SelfAttention(2 * chn)
+        self.attention4 = None # SelfAttention(2 * chn)
         #self.linear = nn.Linear(n_class, 128, bias=False)
         
     def forward(self, z, class_id=None):
@@ -409,6 +417,8 @@ class ConvolutionalImplicitModel(nn.Module):
         if class_id is not None:
           z = latent_and_labels(z, class_id, self.n_class)
         #import pdb; pdb.set_trace()
+        if self.bn0:
+          z = self.relu(self.bn0(self.tconv0(z)))
         if self.attention0: z = self.attention0(z)
         z = self.relu(self.bn1(self.tconv1(z)))
         if self.attention1: z = self.attention1(z)
@@ -463,6 +473,7 @@ class CoolSystem(pl.LightningModule):
         # not the best model...
         #self.l1 = torch.nn.Linear(28 * 28, 10)
         self.z_dim = z_dim
+        self.z_grid = None
         self.hyperparams = hyperparams
         self.shuffle_data = shuffle_data
         self.dci_db = None
@@ -478,6 +489,7 @@ class CoolSystem(pl.LightningModule):
 
         imgs, labels = batch
         data_np = imgs.numpy()
+        #import pdb;  pdb.set_trace()
         data_flat_np = np.reshape(data_np, (data_np.shape[0], np.prod(data_np.shape[1:])))
         
         self.data_np = data_np
@@ -511,6 +523,8 @@ class CoolSystem(pl.LightningModule):
         z_np = z_np[nearest_indices]
         z_np += 0.01*np.random.randn(*z_np.shape)
         self.z_np = z_np
+        if self.z_grid is None:
+          self.z_grid = self.z_np.copy() * 0.7
         
         del samples_np, samples_flat_np
 
@@ -537,6 +551,7 @@ class CoolSystem(pl.LightningModule):
 
         #z_np = self.regen()
         z_np = self.z_np
+        z_grid = self.z_grid
         #cur_z = torch.from_numpy(z_np[i*batch_size:(i+1)*batch_size]).float().cpu()
         #imgTarget = torch.from_numpy(data_np[i*batch_size:(i+1)*batch_size]).float().cpu()
         cur_z = torch.from_numpy(z_np).float().cpu()
@@ -554,6 +569,9 @@ class CoolSystem(pl.LightningModule):
         imgOutput = self.forward(cur_z, imgLabels)
         self.logger.experiment.add_image('imgOutput', torchvision.utils.make_grid(nimg(imgOutput)), self._step)
         if self._step % me.interp_every == 0 and self._step > -1 and True:
+          cur_zgrid = torch.from_numpy(z_grid).float().cpu()
+          imgGrid = self.forward(cur_zgrid, imgLabels)
+          self.logger.experiment.add_image('imgGrid', torchvision.utils.make_grid(nimg(imgGrid)), self._step)
           #print('circle...')
           #import pdb; pdb.set_trace()
           imgs = me.circle_interpolation(self.model, imgInput.shape[0])
@@ -585,7 +603,8 @@ class CoolSystem(pl.LightningModule):
         #pixelLoss = F.mse_loss(imgOutput, imgTarget)
         pixelLoss = self.loss_fn(imgOutput, imgTarget)
         loss = featLoss + pixelLoss
-        tensorboard_logs = {'train_loss': loss}
+        lr = self.lr_fn(self.current_epoch)
+        tensorboard_logs = {'train_loss': loss, 'lr': lr, 'epoch': self.current_epoch}
         self._step += 1
         return {'loss': loss, 'log': tensorboard_logs}
 
@@ -627,14 +646,18 @@ class CoolSystem(pl.LightningModule):
         # can return multiple optimizers and learning_rate schedulers
         # (LBFGS it is automatically supported, no need for closure function)
         #return torch.optim.Adam(self.parameters(), lr=0.0004)
-        epoch = 0
+        #epoch = 0
         hyperparams = self.hyperparams
-        lr = hyperparams.base_lr * hyperparams.decay_rate ** (epoch // hyperparams.decay_step)
+        lr = hyperparams.base_lr # * hyperparams.decay_rate ** (epoch // hyperparams.decay_step)
+        self.lr_fn = lambda epoch: hyperparams.decay_rate ** (epoch // hyperparams.decay_step)
         #optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=1e-5)
         #optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, amsgrad=True)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.5, 0.999), amsgrad=True, weight_decay=1e-5)
         #optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.5, 0.999), amsgrad=True)
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.0, 0.999))
-        return optimizer
+        #optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.0, 0.999))
+        from torch.optim.lr_scheduler import LambdaLR
+        scheduler = LambdaLR(optimizer, lr_lambda=[self.lr_fn])
+        return [optimizer], [scheduler]
         
 
     def prepare_data(self):
@@ -646,7 +669,6 @@ class CoolSystem(pl.LightningModule):
         #self.data_np = np.random.randn(128, 1, 28, 28)
         # self.data_np = np.array([img.numpy() for img, label in dataset])
         # print('ready')
-        
         # data_np = self.data_np
         # hyperparams = self.hyperparams
 
@@ -667,15 +689,103 @@ class CoolSystem(pl.LightningModule):
     def train_dataloader(self):
         # REQUIRED
         #dataset = MNIST(os.getcwd(), train=True, download=False, transform=transforms.ToTensor())
-        dataset = CIFAR10(os.getcwd(), train=True, download=False, transform=transforms.ToTensor())
+        #dataset = CIFAR10(os.getcwd(), train=True, download=False, transform=transforms.ToTensor())
         #loader = DataLoader(dataset, batch_size=32)
 
+        # Downloading/Louding CIFAR10 data
+        trainset  = CIFAR10(root=os.getcwd(), train=True , download=False)#, transform = transform_with_aug)
+        testset   = CIFAR10(root=os.getcwd(), train=False, download=False)#, transform = transform_no_aug)
+        classDict = {'plane':0, 'car':1, 'bird':2, 'cat':3, 'deer':4, 'dog':5, 'frog':6, 'horse':7, 'ship':8, 'truck':9}
+
+        # Separating trainset/testset data/label
+        x_train  = trainset.data
+        x_test   = testset.data
+        y_train  = trainset.targets
+        y_test   = testset.targets
+
+        # Define a function to separate CIFAR classes by class index
+
+        def get_class_i(x, y, i):
+            """
+            x: trainset.train_data or testset.test_data
+            y: trainset.train_labels or testset.test_labels
+            i: class label, a number between 0 to 9
+            return: x_i
+            """
+            # Convert to a numpy array
+            y = np.array(y)
+            # Locate position of labels that equal to i
+            pos_i = np.argwhere(y == i)
+            # Convert the result into a 1-D list
+            pos_i = list(pos_i[:,0])
+            # Collect all data that match the desired label
+            x_i = [x[j] for j in pos_i]
+            
+            return x_i
+
+        class DatasetMaker(Dataset):
+            def __init__(self, datasets, transformFunc = transforms.ToTensor()):
+                """
+                datasets: a list of get_class_i outputs, i.e. a list of list of images for selected classes
+                """
+                self.datasets = datasets
+                self.lengths  = [len(d) for d in self.datasets]
+                self.transformFunc = transformFunc
+            def __getitem__(self, i):
+                class_label, index_wrt_class = self.index_of_which_bin(self.lengths, i)
+                img = self.datasets[class_label][index_wrt_class]
+                if self.transformFunc:
+                  img = self.transformFunc(img)
+                return img, class_label
+
+            def __len__(self):
+                return sum(self.lengths)
+            
+            def index_of_which_bin(self, bin_sizes, absolute_index, verbose=False):
+                """
+                Given the absolute index, returns which bin it falls in and which element of that bin it corresponds to.
+                """
+                # Which class/bin does i fall into?
+                accum = np.add.accumulate(bin_sizes)
+                if verbose:
+                    print("accum =", accum)
+                bin_index  = len(np.argwhere(accum <= absolute_index))
+                if verbose:
+                    print("class_label =", bin_index)
+                # Which element of the fallent class/bin does i correspond to?
+                index_wrt_class = absolute_index - np.insert(accum, 0, 0)[bin_index]
+                if verbose:
+                    print("index_wrt_class =", index_wrt_class)
+
+                return bin_index, index_wrt_class
+
+        # ================== Usage ================== #
+
+        # Let's choose cats (class 3 of CIFAR) and dogs (class 5 of CIFAR) as trainset/testset
+        cat_dog_trainset = \
+            DatasetMaker(
+                [get_class_i(x_train, y_train, classDict['cat']), get_class_i(x_train, y_train, classDict['dog'])]
+                #transform_with_aug
+            )
+        cat_dog_testset  = \
+            DatasetMaker(
+                [get_class_i(x_test , y_test , classDict['cat']), get_class_i(x_test , y_test , classDict['dog'])]
+                #transform_no_aug
+            )
+
+        kwargs = {'num_workers': 2, 'pin_memory': False}
         hyperparams = self.hyperparams
         batch_size = hyperparams.batch_size
-        loader = DataLoader(dataset, batch_size=batch_size)
+
+        # Create datasetLoaders from trainset and testset
+        trainsetLoader   = DataLoader(cat_dog_trainset, batch_size=batch_size, shuffle=True , **kwargs)
+        testsetLoader    = DataLoader(cat_dog_testset , batch_size=batch_size, shuffle=False, **kwargs)
+
+        #loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         # self.data_np = np.array([img.numpy() for img, label in dataset])
         #self._train_loader = loader
-        return loader
+        #return loader
+        return trainsetLoader
 
     # def val_dataloader(self):
     #     dataset = MNIST(os.getcwd(), train=True, download=False, transform=transforms.ToTensor())
@@ -690,11 +800,14 @@ class CoolSystem(pl.LightningModule):
 def main():
   from pytorch_lightning import Trainer
 
-  hparams = Hyperparams(base_lr=1e-2, batch_size=64, num_epochs=1000, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=0.01)
+  hparams = Hyperparams(base_lr=1e-3, batch_size=me.batch_size, num_epochs=100000, decay_step=25, decay_rate=0.4, staleness=5, num_samples_factor=160, train_percent=0.01)
+  #hparams = Hyperparams(base_lr=1e-3, batch_size=me.batch_size, num_epochs=100000, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=40, train_percent=0.01)
+  #hparams = Hyperparams(base_lr=1e-2, batch_size=32, num_epochs=1000, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=40, train_percent=0.01)
   #hparams = Hyperparams(base_lr=1e-3, batch_size=64, num_epochs=10, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=0.1)
   #hparams = Hyperparams(base_lr=1e-3, batch_size=64, num_epochs=10, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=1.0)
-  z_dim = 64
-  model = CoolSystem(z_dim, hparams)
+  #z_dim = 64
+  #z_dim = 128
+  model = CoolSystem(me.z_dim, hparams)
 
   # most basic trainer, uses good defaults
   #trainer = Trainer(num_tpu_cores=8)
