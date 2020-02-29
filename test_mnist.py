@@ -8,6 +8,7 @@ from torch.nn import Parameter
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
+from torchvision.datasets import CIFAR10
 from torchvision import transforms
 import tqdm
 
@@ -387,31 +388,36 @@ class ConvolutionalImplicitModel(nn.Module):
         self.n_class = n_class
         self.tconv1 = nn.ConvTranspose2d(64+n_class, 1024, 1, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(1024)
-        self.tconv2 = nn.ConvTranspose2d(1024, 128, 7, 1, bias=False)
+        self.tconv2 = nn.ConvTranspose2d(1024, 128, 8, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(128)
         self.tconv3 = nn.ConvTranspose2d(128, 64, 4, 2, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(64)
-        self.tconv4 = nn.ConvTranspose2d(64, 1, 4, 2, padding=1, bias=False)
+        self.tconv4 = nn.ConvTranspose2d(64, 3, 4, 2, padding=1, bias=False)
         self.bn4 = None
-        #self.bn4 = nn.BatchNorm2d(1)
         self.relu = nn.ReLU(True)
         chn = 32
         self.attention = None
-        self.attention = SelfAttention(2 * chn)
+        self.attention0 = SelfAttention(2 * chn)
+        self.attention1 = SelfAttention(2 * chn)
+        self.attention2 = SelfAttention(2 * chn)
+        self.attention3 = SelfAttention(2 * chn)
+        self.attention4 = SelfAttention(2 * chn)
         #self.linear = nn.Linear(n_class, 128, bias=False)
         
     def forward(self, z, class_id=None):
         #class_emb = self.linear(class_id)  # 128
         if class_id is not None:
           z = latent_and_labels(z, class_id, self.n_class)
+        #import pdb; pdb.set_trace()
+        if self.attention0: z = self.attention0(z)
         z = self.relu(self.bn1(self.tconv1(z)))
+        if self.attention1: z = self.attention1(z)
         z = self.relu(self.bn2(self.tconv2(z)))
+        if self.attention2: z = self.attention2(z)
         z = self.relu(self.bn3(self.tconv3(z)))
-        if self.attention:
-          z = self.attention(z)
+        if self.attention3: z = self.attention3(z)
         z = self.tconv4(z)
-        if self.bn4 is not None:
-          z = self.bn4(z)
+        if self.attention4: z = self.attention4(z)
         z = torch.sigmoid(z)
         return z
 
@@ -464,10 +470,11 @@ class CoolSystem(pl.LightningModule):
         #self.model = Generator128(z_dim, n_class=10)
         #self.squeezeNet = NetPerLayer()
         self.squeezeNet = None
-        #self.loss_fn = nn.MSELoss()
+        self.loss_fn = nn.MSELoss()
         self._step = 0
 
     def regen(self, batch):
+        #import pdb; pdb.set_trace()
 
         imgs, labels = batch
         data_np = imgs.numpy()
@@ -575,7 +582,8 @@ class CoolSystem(pl.LightningModule):
               featLoss += l
         else:
           featLoss = 0.0
-        pixelLoss = F.mse_loss(imgOutput, imgTarget)
+        #pixelLoss = F.mse_loss(imgOutput, imgTarget)
+        pixelLoss = self.loss_fn(imgOutput, imgTarget)
         loss = featLoss + pixelLoss
         tensorboard_logs = {'train_loss': loss}
         self._step += 1
@@ -624,13 +632,16 @@ class CoolSystem(pl.LightningModule):
         lr = hyperparams.base_lr * hyperparams.decay_rate ** (epoch // hyperparams.decay_step)
         #optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=1e-5)
         #optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, amsgrad=True)
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.5, 0.999), amsgrad=True)
+        #optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.5, 0.999), amsgrad=True)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.0, 0.999))
         return optimizer
         
 
     def prepare_data(self):
-        MNIST(os.getcwd(), train=True, download=True, transform=transforms.ToTensor())
-        MNIST(os.getcwd(), train=False, download=True, transform=transforms.ToTensor())
+        #MNIST(os.getcwd(), train=True, download=True, transform=transforms.ToTensor())
+        #MNIST(os.getcwd(), train=False, download=True, transform=transforms.ToTensor())
+        CIFAR10(os.getcwd(), train=True, download=True, transform=transforms.ToTensor())
+        CIFAR10(os.getcwd(), train=False, download=True, transform=transforms.ToTensor())
 
         #self.data_np = np.random.randn(128, 1, 28, 28)
         # self.data_np = np.array([img.numpy() for img, label in dataset])
@@ -655,7 +666,8 @@ class CoolSystem(pl.LightningModule):
 
     def train_dataloader(self):
         # REQUIRED
-        dataset = MNIST(os.getcwd(), train=True, download=False, transform=transforms.ToTensor())
+        #dataset = MNIST(os.getcwd(), train=True, download=False, transform=transforms.ToTensor())
+        dataset = CIFAR10(os.getcwd(), train=True, download=False, transform=transforms.ToTensor())
         #loader = DataLoader(dataset, batch_size=32)
 
         hyperparams = self.hyperparams
@@ -678,7 +690,8 @@ class CoolSystem(pl.LightningModule):
 def main():
   from pytorch_lightning import Trainer
 
-  hparams = Hyperparams(base_lr=1e-3, batch_size=64, num_epochs=10, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=0.1)
+  hparams = Hyperparams(base_lr=1e-2, batch_size=64, num_epochs=1000, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=0.01)
+  #hparams = Hyperparams(base_lr=1e-3, batch_size=64, num_epochs=10, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=0.1)
   #hparams = Hyperparams(base_lr=1e-3, batch_size=64, num_epochs=10, decay_step=25, decay_rate=1.0, staleness=5, num_samples_factor=10, train_percent=1.0)
   z_dim = 64
   model = CoolSystem(z_dim, hparams)
@@ -689,6 +702,7 @@ def main():
   # train on cpu using only 10% of the data (for demo purposes)
   trainer = Trainer(max_epochs=hparams.num_epochs, train_percent_check=hparams.train_percent)
   trainer.fit(model)   
+  import pdb; pdb.set_trace()
   #trainer.test(model)
 
 if __name__ == '__main__':
