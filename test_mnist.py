@@ -21,13 +21,49 @@ import collections
 Hyperparams = collections.namedtuple('Hyperarams', 'base_lr batch_size num_epochs decay_step decay_rate staleness num_samples_factor train_percent')
 Hyperparams.__new__.__defaults__ = (None, None, None, None, None, None, None, None)
 
+def one_hot_encode(x, n_class):
+  from torch.autograd import Variable
+  #class_emb = self.linear(class_id)  # 128
+  # https://discuss.pytorch.org/t/convert-int-into-one-hot-format/507/11
+  e = nn.Embedding(n_class, n_class) 
+  e.weight.data = torch.eye(n_class)
+  class_emb = e(Variable(torch.LongTensor(x)))
+  return class_emb
+
+def latent_and_labels(z, class_id, n_class):
+  class_emb = one_hot_encode(class_id, n_class)
+  z = torch.cat([class_emb.reshape(class_emb.shape[0], class_emb.shape[1], 1, 1), z], 1)
+  return z
+
+# https://stackoverflow.com/questions/29831489/convert-array-of-indices-to-1-hot-encoded-numpy-array
+def np_one_hot(a, n_class):
+  #b = np.zeros((a.size, a.max()+1))
+  b = np.zeros((a.size, n_class))
+  b[np.arange(a.size),a] = 1
+  return b
+
+def np_latent_and_labels(z, class_id, n_class):
+  class_emb = np_one_hot(np.array(class_id), n_class=n_class)
+  #z = np.concatenate([class_emb.reshape(class_emb.shape[0], class_emb.shape[1], 1, 1), z], 1)
+  z = np.concatenate([class_emb, z], 1)
+  return z
+
+def rand_latent(class_id,z_dim=64,n_class=10):
+  latents_a = np.random.randn(1, z_dim)#.reshape([1,-1,1,1])
+  return np_latent_and_labels(latents_a, class_id, n_class=n_class)
+
 
 #Gs = Gs_network
-rnd = np.random
-shape = [64, 64, 1, 1]
-latents_a = rnd.randn(1, shape[1])
-latents_b = rnd.randn(1, shape[1])
-latents_c = rnd.randn(1, shape[1])
+#rnd = np.random
+#shape = [64, 64, 1, 1]
+#latents_a = rnd.randn(1, shape[1])
+#latents_b = rnd.randn(1, shape[1])
+#latents_c = rnd.randn(1, shape[1])
+#import pdb; pdb.set_trace()
+latents_a = rand_latent(4)
+latents_b = rand_latent(4)
+latents_c = rand_latent(4)
+import pdb; pdb.set_trace()
 
 import math
 
@@ -39,7 +75,8 @@ def vnorm(v):
     return v/vdist(v)
 
 def circ_generator(latents_interpolate):
-    radius = 40.0
+    #radius = 40.0
+    radius = 0.1
     latents_axis_x = (latents_a - latents_b).flatten() / vdist(latents_a - latents_b)
     latents_axis_y = (latents_a - latents_c).flatten() / vdist(latents_a - latents_c)
     latents_x = math.sin(math.pi * 2.0 * latents_interpolate) * radius
@@ -140,11 +177,159 @@ class SelfAttention(nn.Module):
     out = self.o_conv(attn_g)
     return self.gamma * out + x
 
+
+class ConditionalBatchNorm2d(nn.Module):
+  def __init__(self, num_features, num_classes, eps=1e-4, momentum=0.1):
+    super().__init__()
+    self.num_features = num_features
+    self.bn = nn.BatchNorm2d(num_features, affine=False, eps=eps, momentum=momentum)
+    self.gamma_embed = SpectralNorm(nn.Linear(num_classes, num_features, bias=False))
+    self.beta_embed = SpectralNorm(nn.Linear(num_classes, num_features, bias=False))
+
+  def forward(self, x, y):
+    out = self.bn(x)
+    gamma = self.gamma_embed(y) + 1
+    beta = self.beta_embed(y)
+    out = gamma.view(-1, self.num_features, 1, 1) * out + beta.view(-1, self.num_features, 1, 1)
+    return out
+
+class CBatchNorm2d(nn.Module):
+  def __init__(self, num_features, z_dim=148):
+    super().__init__()
+    self.num_features = num_features
+    self.HyperBN = ConditionalBatchNorm2d(in_channel, z_dim)
+    self.HyperBN_1 = ConditionalBatchNorm2d(out_channel, z_dim)
+
+
+class GBlock(nn.Module):
+  def __init__(
+    self,
+    in_channel,
+    out_channel,
+    kernel_size=[3, 3],
+    padding=1,
+    stride=1,
+    n_class=None,
+    bn=True,
+    activation=F.relu,
+    upsample=True,
+    downsample=False,
+    z_dim=148,
+  ):
+    super().__init__()
+
+    self.conv0 = SpectralNorm(
+      nn.Conv2d(in_channel, out_channel, kernel_size, stride, padding, bias=True if bn else True)
+    )
+    self.conv1 = SpectralNorm(
+      nn.Conv2d(out_channel, out_channel, kernel_size, stride, padding, bias=True if bn else True)
+    )
+
+    self.skip_proj = False
+    if in_channel != out_channel or upsample or downsample:
+      self.conv_sc = SpectralNorm(nn.Conv2d(in_channel, out_channel, 1, 1, 0))
+      self.skip_proj = True
+
+    self.upsample = upsample
+    self.downsample = downsample
+    self.activation = activation
+    self.bn = bn
+    if bn:
+      self.HyperBN = ConditionalBatchNorm2d(in_channel, z_dim)
+      self.HyperBN_1 = ConditionalBatchNorm2d(out_channel, z_dim)
+
+  def forward(self, input, condition=None):
+    out = input
+
+    if self.bn:
+      out = self.HyperBN(out, condition)
+    out = self.activation(out)
+    if self.upsample:
+      out = F.interpolate(out, scale_factor=2)
+    out = self.conv0(out)
+    if self.bn:
+      out = self.HyperBN_1(out, condition)
+    out = self.activation(out)
+    out = self.conv1(out)
+
+    if self.downsample:
+      out = F.avg_pool2d(out, 2)
+
+    if self.skip_proj:
+      skip = input
+      if self.upsample:
+        skip = F.interpolate(skip, scale_factor=2)
+      skip = self.conv_sc(skip)
+      if self.downsample:
+        skip = F.avg_pool2d(skip, 2)
+    else:
+      skip = input
+    return out + skip
+
+class Generator128(nn.Module):
+  def __init__(self, code_dim=120, n_class=1000, chn=96, debug=False):
+    super().__init__()
+
+    self.linear = nn.Linear(n_class, 128, bias=False)
+
+    if debug:
+      chn = 8
+
+    self.first_view = 16 * chn
+
+    self.G_linear = SpectralNorm(nn.Linear(20, 4 * 4 * 16 * chn))
+
+    z_dim = code_dim + 28
+
+    self.GBlock = nn.ModuleList([
+      GBlock(16 * chn, 16 * chn, n_class=n_class, z_dim=z_dim),
+      GBlock(16 * chn, 8 * chn, n_class=n_class, z_dim=z_dim),
+      GBlock(8 * chn, 4 * chn, n_class=n_class, z_dim=z_dim),
+      GBlock(4 * chn, 2 * chn, n_class=n_class, z_dim=z_dim),
+      GBlock(2 * chn, 1 * chn, n_class=n_class, z_dim=z_dim),
+    ])
+
+    self.sa_id = 4
+    self.num_split = len(self.GBlock) + 1
+    self.attention = SelfAttention(2 * chn)
+    self.ScaledCrossReplicaBN = nn.BatchNorm2d(1 * chn, eps=1e-4)
+    self.colorize = SpectralNorm(nn.Conv2d(1 * chn, 3, [3, 3], padding=1))
+
+    #self.embed = nn.Embedding(n_class, 16 * chn)
+    #self.embed.weight.data.uniform_(-0.1, 0.1)
+    #self.embed = SpectralNorm(self.embed)
+    
+
+  def forward(self, input, class_id):
+    codes = torch.chunk(input, self.num_split, 1)
+    #classes = torch.chunk(class_id, self.num_split, 0)
+    #emb = self.embed(class_id)  # 128
+    from torch.autograd import Variable
+    #class_emb = self.linear(class_id)  # 128
+    # https://discuss.pytorch.org/t/convert-int-into-one-hot-format/507/11
+    e = nn.Embedding(10, 10) 
+    e.weight.data = torch.eye(10)
+    class_emb = e(Variable(torch.LongTensor(class_id)))
+    import pdb; pdb.set_trace()
+
+    out = self.G_linear(codes[0])
+    out = out.view(-1, 4, 4, self.first_view).permute(0, 3, 1, 2)
+    for i, (code, GBlock) in enumerate(zip(codes[1:], self.GBlock)):
+      if i == self.sa_id:
+        out = self.attention(out)
+      condition = torch.cat([code, class_emb], 1)
+      out = GBlock(out, condition)
+
+    out = self.ScaledCrossReplicaBN(out)
+    out = F.relu(out)
+    out = self.colorize(out)
+    return torch.tanh(out)
+
 class ConvolutionalImplicitModel(nn.Module):
-    def __init__(self, z_dim):
+    def __init__(self, z_dim, n_class=10):
         super(ConvolutionalImplicitModel, self).__init__()
-        self.z_dim = z_dim
-        self.tconv1 = nn.ConvTranspose2d(64, 1024, 1, 1, bias=False)
+        self.n_class = n_class
+        self.tconv1 = nn.ConvTranspose2d(64+n_class, 1024, 1, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(1024)
         self.tconv2 = nn.ConvTranspose2d(1024, 128, 7, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(128)
@@ -157,8 +342,12 @@ class ConvolutionalImplicitModel(nn.Module):
         chn = 32
         self.attention = None
         self.attention = SelfAttention(2 * chn)
+        #self.linear = nn.Linear(n_class, 128, bias=False)
         
-    def forward(self, z):
+    def forward(self, z, class_id=None):
+        #class_emb = self.linear(class_id)  # 128
+        if class_id is not None:
+          z = latent_and_labels(z, class_id, self.n_class)
         z = self.relu(self.bn1(self.tconv1(z)))
         z = self.relu(self.bn2(self.tconv2(z)))
         z = self.relu(self.bn3(self.tconv3(z)))
@@ -169,6 +358,7 @@ class ConvolutionalImplicitModel(nn.Module):
           z = self.bn4(z)
         z = torch.sigmoid(z)
         return z
+
 
 
 def pearsonr(x, y):
@@ -215,6 +405,7 @@ class CoolSystem(pl.LightningModule):
         self.shuffle_data = shuffle_data
         self.dci_db = None
         self.model = ConvolutionalImplicitModel(z_dim)
+        #self.model = Generator128(z_dim, n_class=10)
         #self.squeezeNet = NetPerLayer()
         self.squeezeNet = None
         #self.loss_fn = nn.MSELoss()
@@ -240,7 +431,7 @@ class CoolSystem(pl.LightningModule):
         samples_np = np.empty((num_samples * batch_size,)+data_np.shape[1:])
         for i in range(num_samples):
           z = torch.randn(batch_size, self.z_dim, 1, 1).cpu()
-          samples = self.model(z)
+          samples = self.model(z, labels)
           z_np[i*batch_size:(i+1)*batch_size] = z.cpu().data.numpy()
           samples_np[i*batch_size:(i+1)*batch_size] = samples.cpu().data.numpy()
         
@@ -265,8 +456,8 @@ class CoolSystem(pl.LightningModule):
     # def forward(self, x):
     #     return torch.relu(self.l1(x.view(x.size(0), -1)))
 
-    def forward(self, z):
-        cur_samples = self.model(z)
+    def forward(self, z, class_id=None):
+        cur_samples = self.model(z, class_id)
         return cur_samples
 
     def training_step(self, batch, batch_idx):
@@ -295,11 +486,13 @@ class CoolSystem(pl.LightningModule):
           img = torch.clamp(img, 0, 1)
           return img
         imgInput = batch[0]
+        imgLabels = batch[1]
         self.logger.experiment.add_image('imgInput', torchvision.utils.make_grid(nimg(imgInput)), self._step)
-        imgOutput = self.forward(cur_z)
+        imgOutput = self.forward(cur_z, imgLabels)
         self.logger.experiment.add_image('imgOutput', torchvision.utils.make_grid(nimg(imgOutput)), self._step)
-        if self._step % 1 == 0 and False:
+        if self._step % 20 == 0 and True:
           #print('circle...')
+          #import pdb; pdb.set_trace()
           imgs = self.circle_interpolation(imgInput.shape[0])
           #imgs = np.array(imgs)
           #imgs = torch.from_numpy(imgs).float().cpu()
@@ -332,6 +525,16 @@ class CoolSystem(pl.LightningModule):
         self._step += 1
         return {'loss': loss, 'log': tensorboard_logs}
 
+    def number_interpolation(self, count, lo, hi):
+        hyperparams = self.hyperparams
+        batch_size = hyperparams.batch_size
+
+        def gen_latent(pos):
+          z = gen_func(pos)
+          z = z.reshape([1,-1,1,1])
+          return z
+
+
     def circle_interpolation(self, count, gen_func=circ_generator, max_step=1.0/64.0, change_min=10.0, change_max=11.0):
         hyperparams = self.hyperparams
         batch_size = hyperparams.batch_size
@@ -345,7 +548,7 @@ class CoolSystem(pl.LightningModule):
             #fmt = dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True)
             #current_image = Gs.run(current_latent, None, truncation_psi=0.5, randomize_noise=False, output_transform=fmt)[0]
             z = np.array(current_latent)
-            z = z.reshape([batch_size,self.z_dim,1,1])
+            #z = z.reshape([batch_size,-1,1,1])
             z = torch.from_numpy(z).float().cpu()
             imgs = self.model(z)
             return imgs
@@ -359,7 +562,13 @@ class CoolSystem(pl.LightningModule):
               current_pos = (upper + lower) / 2.0
               current_latent = gen_latent(current_pos)
               yield current_latent
-        z = list(build_latent(count))
+
+        def get_latents(count):
+          z = list(build_latent(count))
+          z = np.concatenate(z, axis=0)
+          return z
+
+        z = get_latents(count)
         return generate(z)
 
         current_pos = 0.0
