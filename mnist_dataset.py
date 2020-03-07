@@ -92,8 +92,11 @@ def download(directory, filename):
   return filepath
 
 
-def dataset(directory, images_file, labels_file):
+def dataset(directory, images_file, labels_file, resolution, channels):
   """Download and parse MNIST dataset."""
+
+  if not isinstance(resolution, list):
+    resolution = [resolution, resolution]
 
   images_file = download(directory, images_file)
   labels_file = download(directory, labels_file)
@@ -104,8 +107,16 @@ def dataset(directory, images_file, labels_file):
   def decode_image(image):
     # Normalize from [0, 255] to [0.0, 1.0]
     image = tf.decode_raw(image, tf.uint8)
+    image = tf.reshape(image, [1, 1, 28, 28])
+    image = tf.transpose(image, [0,2,3,1])
+    #import pdb; pdb.set_trace()
+    image = tf.image.resize_area(image, resolution)
+    #image = tf.image.resize_bilinear(image, resolution)
+    image = tf.concat((image,)*channels, axis=-1) # convert to RGB
+    #import pdb; pdb.set_trace()
+    image = tf.transpose(image, [0,3,1,2])
     image = tf.cast(image, tf.float32)
-    image = tf.reshape(image, [784])
+    #image = tf.reshape(image, [channels*np.prod(resolution)])
     return image / 255.0
 
   def decode_label(label):
@@ -120,33 +131,39 @@ def dataset(directory, images_file, labels_file):
   return tf.data.Dataset.zip((images, labels))
 
 
-def train(directory):
+def train(directory, resolution=28, channels=1):
   """tf.data.Dataset object for MNIST training data."""
-  return dataset(directory, 'train-images-idx3-ubyte',
-                 'train-labels-idx1-ubyte')
+  return dataset(directory, 'train-images-idx3-ubyte', 'train-labels-idx1-ubyte', resolution=resolution, channels=channels)
 
 
-def test(directory):
+def test(directory, resolution=28, channels=1):
   """tf.data.Dataset object for MNIST test data."""
-  return dataset(directory, 't10k-images-idx3-ubyte', 't10k-labels-idx1-ubyte')
+  return dataset(directory, 't10k-images-idx3-ubyte', 't10k-labels-idx1-ubyte', resolution=resolution, channels=channels)
 
-def get_mnist(n, only_labels=None):
+def get_mnist(n, only_labels=None, resolution=28, channels=1):
   if only_labels is not None and not isinstance(only_labels, list):
     only_labels = [only_labels]
   with tf.Session() as sess:
-    t = train('MNIST')
+    t = train('MNIST', resolution=resolution, channels=channels)
     it = t.make_initializable_iterator()
     sess.run(it.initializer)
     nxt = it.get_next()
     for i in range(n):
       while True:
         image, label = sess.run(nxt)
-        if only_labels and label in only_labels:
+        if not only_labels or label in only_labels:
           yield image, label
           break
 
 def get_mnist_images(n, **kws):
-  return np.array([x[0] for x in get_mnist(n, **kws)]).reshape([-1,1,28,28])
+  resolution = 28
+  if 'resolution' in kws:
+    resolution = kws.pop('resolution')
+  resolution = [resolution, resolution]
+  channels = 1
+  if 'channels' in kws:
+    channels = kws.pop('channels')
+  return np.array([x[0] for x in get_mnist(n, resolution=resolution, channels=channels, **kws)]).reshape([-1,channels] + resolution)
 
 def save_mnist_image(sample, outfile):
   with tf.Session() as sess:
