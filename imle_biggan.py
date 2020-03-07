@@ -36,6 +36,11 @@ from dci import DCI
 import collections
 import os
 
+class Namespace():
+  pass
+
+me = Namespace()
+
 Hyperparams = collections.namedtuple('Hyperarams', 'base_lr batch_size num_epochs decay_step decay_rate staleness num_samples_factor')
 Hyperparams.__new__.__defaults__ = (None, None, None, None, None, None, None)
 
@@ -45,10 +50,105 @@ Resolution = 32
 #z_dim = 128
 #Images = 128
 Images = 16
-z_dim = 64
+z_dim = me.z_dim = 64
 Classes = len(Labels)
 Channels = 3
 BatchSize = 16
+#me.radius = 4.0
+me.radius = 40.0
+#me.radius = 10.0
+me.batch_size = 512
+me.max_step = 2.0/me.batch_size
+
+def rand_latent(class_id=None,z_dim=None,n_class=10):
+  if z_dim is None:
+    z_dim = me.z_dim
+  batch_size = 1
+  z = torch.randn(z_dim, requires_grad=False).cpu()
+  #y = torch.randint(low=0, high=Classes, size=(1,), dtype=torch.int64, requires_grad=False).cpu()
+  y = torch.randint(low=0, high=1, size=(1,), dtype=torch.int64, requires_grad=False).cpu()
+  #z = np.random.randn(1, z_dim)#.reshape([1,-1,1,1])
+  #if class_id is not None:
+  #  z = np_latent_and_labels(z, class_id, n_class=n_class)
+  return z, y
+
+#Gs = Gs_network
+#rnd = np.random
+#shape = [128, 128, 1, 1]
+#latents_a = rnd.randn(1, shape[1])
+#latents_b = rnd.randn(1, shape[1])
+#latents_c = rnd.randn(1, shape[1])
+#import pdb; pdb.set_trace()
+me.latents_a, me.labels_a = rand_latent()
+me.latents_b, me.labels_b = rand_latent()
+me.latents_c, me.labels_c = rand_latent()
+
+import math
+
+def vdist(v):
+  v = v.flatten()
+  return np.dot(v,v)**0.5
+
+def vnorm(v):
+    return v/vdist(v)
+
+def circ_generator(latents_interpolate):
+    #radius = 40.0
+    #radius = 0.1
+    radius = me.radius
+    latents_axis_x = (me.latents_a - me.latents_b).flatten() / vdist(me.latents_a - me.latents_b)
+    latents_axis_y = (me.latents_a - me.latents_c).flatten() / vdist(me.latents_a - me.latents_c)
+    latents_x = math.sin(math.pi * 2.0 * latents_interpolate) * radius
+    latents_y = math.cos(math.pi * 2.0 * latents_interpolate) * radius
+    latents = me.latents_a + latents_x * latents_axis_x + latents_y * latents_axis_y
+    #class_id=1
+    #n_class=10
+    #latents = np_latent_and_labels(latents, class_id, n_class=n_class)
+    return latents
+
+me.circ_generator = circ_generator
+
+def circle_interpolation(model, count, gen_func=None, max_step=None, change_min=10.0, change_max=11.0):
+    if gen_func is None:
+      gen_func = me.circ_generator
+    if max_step is None:
+      max_step = me.max_step
+
+    def gen_latent(pos):
+      z = gen_func(pos)
+      z = z.reshape([1,-1])
+      return z
+
+    def generate(current_latent):
+        #fmt = dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True)
+        #current_image = Gs.run(current_latent, None, truncation_psi=0.5, randomize_noise=False, output_transform=fmt)[0]
+        z = np.array(current_latent)
+        z = torch.from_numpy(z).float().cpu()
+        y = me.labels_a
+        y = torch.stack((y,)*z.shape[0], axis=0)
+        #import pdb; pdb.set_trace()
+        imgs = model(z, model.shared(y))
+        return imgs
+
+    def build_latent(count, current_pos=0.0):
+      current_latent = gen_latent(current_pos)
+      yield current_latent
+      for i in range(count - 1):
+          lower = current_pos
+          upper = current_pos + max_step
+          current_pos = (upper + lower) / 2.0
+          current_latent = gen_latent(current_pos)
+          yield current_latent
+
+    def get_latents(count):
+      z = list(build_latent(count))
+      z = np.concatenate(z, axis=0)
+      return z
+
+    z = get_latents(count)
+    return generate(z)
+
+me.circle_interpolation = circle_interpolation
 
 class ConvolutionalImplicitModel(nn.Module):
     def __init__(self, z_dim):
@@ -177,6 +277,15 @@ def main(*args):
 
     if os.path.isfile(os.path.join(path, 'net_weights.pth')):
         imle.model.load_state_dict(torch.load(os.path.join(path, 'net_weights.pth')))
+
+    if False:
+        imgs = me.circle_interpolation(imle.model.eval(), me.batch_size)
+        print('Saving...')
+        save_image_grid(imgs.detach().numpy(), "samples/samples.jpg", "samples/frame_%04d.jpg")
+        #import pdb; pdb.set_trace()
+        import sys
+        sys.exit(0)
+        #import pdb; pdb.set_trace()
     
     # Hyperparameters:
     
@@ -224,6 +333,18 @@ def create_image_grid(images, grid_size=None):
         y = (idx // grid_w) * img_h
         grid[..., y : y + img_h, x : x + img_w] = np.clip(images[idx], 0, 255)
     return grid
+
+def save_image_grid(images, outfile, outspec=None):
+    images = images*255
+    grid = create_image_grid(images.copy()).transpose([1,2,0])
+    mnist_dataset.save_mnist_image(grid, outfile)
+    if outspec:
+      for i, img in enumerate(images):
+        #import pdb; pdb.set_trace()
+        img = img.transpose([1,2,0])
+        #mnist_dataset.save_mnist_image(img, outspec % i)
+        from PIL import Image
+        Image.fromarray(img.clip(0,255).astype(np.uint8)).save(outspec % i)
 
 def save_grid(path, index, count, *args, **kws):
     try:
