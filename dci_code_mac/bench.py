@@ -41,10 +41,10 @@ def gen_data(ambient_dim, intrinsic_dim, num_points):
 
 def main(*args):
     
-    dim = 5000
-    intrinsic_dim = 50
-    num_points = 10000
-    num_queries = 5
+    dim = 32*32*3
+    intrinsic_dim = 2
+    num_queries = 500
+    num_points = num_queries*10
     num_neighbours = 10    # The k in k-NN
     
     # Guide for tuning hyperparameters:
@@ -70,6 +70,7 @@ def main(*args):
     data_and_queries = gen_data(dim, intrinsic_dim, num_points + num_queries)
     data = np.copy(data_and_queries[:num_points,:])
     queries = data_and_queries[num_points:,:]
+    import pdb; pdb.set_trace()
     
     print("Took %.4fs" % (time() - t0))
     
@@ -87,8 +88,8 @@ def main(*args):
     nearest_neighbour_idx, nearest_neighbour_dists = dci_db.query(queries, num_neighbours = num_neighbours, field_of_view = query_field_of_view, prop_to_retrieve = query_prop_to_retrieve)
     
     print("Took %.4fs" % (time() - t0))
-    print(nearest_neighbour_idx)
-    print(nearest_neighbour_dists)
+    #print(nearest_neighbour_idx)
+    #print(nearest_neighbour_dists)
     
 if __name__ == '__main__':
     main(*sys.argv[1:])
